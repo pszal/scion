@@ -51,6 +51,7 @@ typedef struct {
 #define SVC_PATH_MGMT 1
 #define SVC_CERT_MGMT 2
 #define SVC_SIBRA 3
+#define SVC_NONE 65535
 
 #define SVC_MULTICAST 0x8000
 

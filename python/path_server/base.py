@@ -327,7 +327,6 @@ class PathServer(SCIONElement, metaclass=ABCMeta):
                 to_remove = []
                 for req, meta, logger in self.pending_req[key]:
                     if self.path_resolution(req, meta, new_request=False, logger=logger):
-                        meta.close()
                         to_remove.append((req, meta, logger))
                 # Clean state.
                 for req_meta in to_remove:

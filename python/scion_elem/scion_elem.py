@@ -31,8 +31,6 @@ from prometheus_client import Counter, Gauge, start_http_server
 from lib.config import Config
 from lib.crypto.certificate_chain import verify_sig_chain_trc
 from lib.crypto.hash_tree import ConnectedHashTree
-from lib.errors import SCIONParseError, SCIONVerificationError
-from lib.flagtypes import TCPFlags
 from lib.defines import (
     AS_CONF_FILE,
     BEACON_SERVICE,
@@ -48,10 +46,13 @@ from lib.defines import (
 from lib.errors import (
     SCIONBaseError,
     SCIONChecksumFailed,
+    SCIONParseError,
     SCIONTCPError,
     SCIONTCPTimeout,
     SCIONServiceLookupError,
+    SCIONVerificationError,
 )
+from lib.flagtypes import TCPFlags
 from lib.log import log_exception
 from lib.msg_meta import (
     MetadataBase,
@@ -76,6 +77,7 @@ from lib.packet.scion import (
     build_base_hdrs,
 )
 from lib.packet.svc import SVC_TO_SERVICE, SERVICE_TO_SVC_A
+from lib.packet.scion import msg_from_raw
 from lib.packet.scion_addr import ISD_AS, SCIONAddr
 from lib.packet.scion_udp import SCIONUDPHeader
 from lib.packet.scmp.errors import (
@@ -96,7 +98,7 @@ from lib.packet.scmp.types import SCMPClass
 from lib.packet.scmp.util import scmp_type_name
 from lib.packet.pcb import PathSegment
 from lib.socket import ReliableSocket, SocketMgr, TCPSocketWrapper
-from lib.tcp.socket import SCIONTCPSocket, SockOpt
+from lib.tcp.socket import add_send_hdr, SCIONTCPSocket, SockOpt
 from lib.thread import thread_safety_net, kill_self
 from lib.trust_store import TrustStore
 from lib.types import AddrType, L4Proto, PayloadClass
@@ -129,7 +131,7 @@ class SCIONElement(object):
     """
     SERVICE_TYPE = None
     STARTUP_QUIET_PERIOD = STARTUP_QUIET_PERIOD
-    USE_TCP = False
+    USE_TCP = True
     # Timeout for TRC or Certificate requests.
     TRC_CC_REQ_TIMEOUT = 3
 
@@ -183,6 +185,7 @@ class SCIONElement(object):
             self._DefaultMeta = TCPMetadata
         else:
             self._DefaultMeta = UDPMetadata
+        self._msg_parser = msg_from_raw
         self.unverified_segs = set()
         self.unv_segs_lock = threading.RLock()
         self.requested_trcs = {}
@@ -203,6 +206,7 @@ class SCIONElement(object):
         """
         self._tcp_sock = None
         self._tcp_new_conns = queue.Queue(MAX_QUEUE)  # New TCP connections.
+        self._tcp_send_queue = queue.Queue(MAX_QUEUE)  # TCP data to be sent.
         if self._port is None:
             # No scion socket desired.
             return
@@ -227,8 +231,6 @@ class SCIONElement(object):
         self._socks.add(self._udp_sock, self.handle_recv)
 
     def _setup_tcp_accept_socket(self, svc):
-        if not self.USE_TCP:
-            return
         MAX_TRIES = 40
         for i in range(MAX_TRIES):
             try:
@@ -355,8 +357,6 @@ class SCIONElement(object):
         # Otherwise request missing trcs, certs
         self._request_missing_trcs(seg_meta)
         self._request_missing_certs(seg_meta)
-        if seg_meta.meta:
-            seg_meta.meta.close()
 
     def _try_to_verify_seg(self, seg_meta):
         """
@@ -371,8 +371,6 @@ class SCIONElement(object):
             return
         with self.unv_segs_lock:
             self.unverified_segs.discard(seg_meta)
-        if seg_meta.meta:
-            seg_meta.meta.close()
         seg_meta.callback(seg_meta)
 
     def _get_cs(self):
@@ -488,7 +486,6 @@ class SCIONElement(object):
         :param rep: TRC reply.
         :type rep: TRCReply.
         """
-        meta.close()
         isd, ver = rep.trc.get_isd_ver()
         logging.info("TRC reply received for %sv%s from %s" % (isd, ver, meta))
         self.trust_store.add_trc(rep.trc, True)
@@ -502,7 +499,6 @@ class SCIONElement(object):
         if meta.get_addr().isd_as != self.addr.isd_as:
             cs_meta = self._get_cs()
             self.send_meta(rep, cs_meta)
-            cs_meta.close()
         # Remove received TRC from map
         self._check_segs_with_rec_trc(isd, ver)
 
@@ -534,7 +530,6 @@ class SCIONElement(object):
     def process_cert_chain_reply(self, rep, meta):
         """Process a certificate chain reply."""
         assert isinstance(rep, CertChainReply)
-        meta.close()
         isd_as, ver = rep.chain.get_leaf_isd_as_ver()
         logging.info("Cert chain reply received for %sv%s from %s" % (isd_as, ver, meta))
         self.trust_store.add_cert(rep.chain, True)
@@ -544,7 +539,6 @@ class SCIONElement(object):
         if meta.get_addr().isd_as != self.addr.isd_as:
             cs_meta = self._get_cs()
             self.send_meta(rep, cs_meta)
-            cs_meta.close()
         # Remove received cert chain from map
         self._check_segs_with_rec_cert(isd_as, ver)
 
@@ -789,7 +783,7 @@ class SCIONElement(object):
         assert isinstance(meta, MetadataBase)
         if isinstance(meta, TCPMetadata):
             assert not next_hop_port, next_hop_port
-            return self._send_meta_tcp(msg, meta)
+            return self._tcp_send_queue_put(msg, meta)
         elif isinstance(meta, SockOnlyMetadata):
             assert not next_hop_port, next_hop_port
             return meta.sock.send(msg)
@@ -808,12 +802,17 @@ class SCIONElement(object):
             return False
         return self.send(pkt, *next_hop_port)
 
-    def _send_meta_tcp(self, msg, meta):
-        if not meta.sock:
-            tcp_sock = self._tcp_sock_from_meta(meta)
-            meta.sock = tcp_sock
-            self._tcp_conns_put(tcp_sock)
-        return meta.sock.send_msg(msg.pack_full())
+    def _tcp_connect_and_send(self, msg, meta, event=None):
+        assert not meta.sock
+        tcp_sock = self._tcp_sock_from_meta(meta)
+        if not tcp_sock.is_active():
+            if event:  # Signal waiting threads that you are done and remove the event.
+                event.set()
+                del self._tcp_shared_socks_events[meta.get_addr()]
+            return
+        meta.sock = tcp_sock
+        self._tcp_conns_put(tcp_sock)
+        self._tcp_send_queue_put(msg, meta)
 
     def _tcp_sock_from_meta(self, meta):
         assert meta.host
@@ -831,7 +830,7 @@ class SCIONElement(object):
             sock = None
             active = False
         # Create and return TCPSocketWrapper
-        return TCPSocketWrapper(sock, dst, meta.path, active)
+        return TCPSocketWrapper(sock, dst, meta.path, active, self._msg_parser)
 
     def _tcp_conns_put(self, sock):
         dropped = 0
@@ -847,6 +846,21 @@ class SCIONElement(object):
                 break
         if dropped > 0:
             logging.warning("%d TCP connection(s) dropped" % dropped)
+
+    def _tcp_send_queue_put(self, msg, meta):
+        dropped = 0
+        while True:
+            try:
+                self._tcp_send_queue.put((msg, meta), block=False)
+            except queue.Full:
+                self._tcp_send_queue.get_nowait()
+                logging.error("TCP: _tcp_send_queue is full. Dropping old msg")
+                dropped += 1
+            else:
+                break
+        if dropped > 0:
+            logging.warning("%d TCP message(s) dropped" % dropped)
+        return True
 
     def run(self):
         """
@@ -986,7 +1000,7 @@ class SCIONElement(object):
 
     def _tcp_start(self):
         # FIXME(PSz): hack to get python router working.
-        if not hasattr(self, "_tcp_sock") or not self.USE_TCP:
+        if not hasattr(self, "_tcp_sock"):
             return
         if not self._tcp_sock:
             logging.warning("TCP: accept socket is unset, port:%d", self._port)
@@ -994,13 +1008,16 @@ class SCIONElement(object):
         threading.Thread(
             target=thread_safety_net, args=(self._tcp_accept_loop,),
             name="Elem._tcp_accept_loop", daemon=True).start()
+        threading.Thread(
+            target=thread_safety_net, args=(self._tcp_send_loop,),
+            name="Elem._tcp_send_loop", daemon=True).start()
 
     def _tcp_accept_loop(self):
+        logging.debug("TCP: entering _tcp_accept_loop()")
         while self.run_flag.is_set():
             try:
-                logging.debug("TCP: waiting for connections")
-                self._tcp_conns_put(TCPSocketWrapper(*self._tcp_sock.accept()))
-                logging.debug("TCP: accepted connection")
+                self._tcp_conns_put(TCPSocketWrapper(*self._tcp_sock.accept(),
+                                                     msg_parser=self._msg_parser))
             except SCIONTCPTimeout:
                 pass
             except SCIONTCPError:
@@ -1014,7 +1031,7 @@ class SCIONElement(object):
 
     def _tcp_socks_update(self):
         # FIXME(PSz): hack to get python router working.
-        if not hasattr(self, "_tcp_sock") or not self.USE_TCP:
+        if not hasattr(self, "_tcp_sock"):
             return
         self._socks.remove_inactive()
         self._tcp_add_waiting()
@@ -1031,14 +1048,12 @@ class SCIONElement(object):
         """
         Callback to handle a ready recving socket
         """
-        msg, meta = sock.get_msg_meta()
-        logging.debug("tcp_handle_recv:%s, %s", msg, meta)
-        if msg is None and meta is None:
+        msgs, meta = sock.get_msgs_meta()
+        for msg in msgs:
+            self._in_buf_put((msg, meta))
+        if not msgs and meta is None:
             self._socks.remove(sock)
             sock.close()
-            return
-        if msg:
-            self._in_buf_put((msg, meta))
 
     def _tcp_clean(self):
         if not hasattr(self, "_tcp_sock") or not self._tcp_sock:
@@ -1050,6 +1065,90 @@ class SCIONElement(object):
             except queue.Empty:
                 break
             tcp_sock.close()
+
+    def _tcp_send_loop(self):
+        self._sock2buf = defaultdict(bytes)
+        self._tcp_shared_socks = {}
+        self._tcp_shared_socks_events = {}
+        while self.run_flag.is_set():
+            # Wait if nothing to do
+            if self._tcp_send_queue.empty() and not self._sock2buf:
+                msg, meta = self._tcp_send_queue.get()
+                self._tcp_handle_msg_meta(msg, meta)
+            # Drain the queue
+            while not self._tcp_send_queue.empty():
+                try:
+                    msg, meta = self._tcp_send_queue.get_nowait()
+                except queue.Empty:
+                    break
+                self._tcp_handle_msg_meta(msg, meta)
+            # Now send what is missing
+            for sock in self._sock2buf:
+                sent = sock.send_msg(self._sock2buf[sock])
+                self._sock2buf[sock] = self._sock2buf[sock][sent:]
+            for sock in list(self._sock2buf):
+                if not sock.is_active() or not self._sock2buf[sock]:
+                    del self._sock2buf[sock]
+
+    def _tcp_handle_msg_meta(self, msg, meta):
+        self._tcp_clean_shared_socks()
+        addr = meta.get_addr()
+        # Meta has associated socket, use it for sending msg
+        if meta.sock:
+            self._sock2buf[meta.sock] += add_send_hdr(msg.pack_full())
+            # This is the first connected reused socket
+            if meta.reuse:
+                self._tcp_shared_socks[addr] = meta.sock
+                self._tcp_shared_socks_events[addr].set()
+                del self._tcp_shared_socks_events[addr]
+            return
+        # No socket associated and reuse=False. Just open a new connection.
+        if not meta.reuse:
+            threading.Thread(
+                target=thread_safety_net,
+                args=(self._tcp_connect_and_send, msg, meta),
+                name="Elem._tcp_connect_and_send", daemon=False).start()
+            return
+        # msg to be sent by a shared/reused socket, try to find one.
+        if addr in self._tcp_shared_socks:
+            meta.sock = self._tcp_shared_socks[addr]
+            if meta.sock.is_path_stale():
+                meta.sock.update_path(meta.path, *self._get_first_hop(meta.path, addr))
+                logging.debug("updated path for sock: %s" % meta.sock)
+            self._sock2buf[meta.sock] += add_send_hdr(msg.pack_full())
+            logging.debug("reusing sock: %s" % meta.sock)
+            return
+        # no existing socket, check for connecting ones
+        if addr in self._tcp_shared_socks_events:
+            event = self._tcp_shared_socks_events[addr]
+            threading.Thread(
+                target=thread_safety_net,
+                args=(self._tcp_wait_for_connect, msg, meta, event),
+                name="Elem._tcp_wait_for_connect", daemon=False).start()
+            return
+        # no connecting socket, create one
+        event = threading.Event()
+        event.clear()
+        self._tcp_shared_socks_events[addr] = event
+        threading.Thread(
+            target=thread_safety_net,
+            args=(self._tcp_connect_and_send, msg, meta, event),
+            name="Elem._tcp_connect_and_send", daemon=False).start()
+
+    def _tcp_clean_shared_socks(self):
+        # Remove inactive shared sockets
+        for key in list(self._tcp_shared_socks):
+            if not self._tcp_shared_socks[key].is_active():
+                del self._tcp_shared_socks[key]
+        # Remove waiting locks
+        for key in list(self._tcp_shared_socks_events):
+            if self._tcp_shared_socks_events[key].is_set():
+                del self._tcp_shared_socks_events[key]
+
+    def _tcp_wait_for_connect(self, msg, meta, event):
+        event.wait()
+        # connect() is done, queue the message.
+        self._tcp_send_queue_put(msg, meta)
 
     def stop(self):
         """Shut down the daemon thread."""

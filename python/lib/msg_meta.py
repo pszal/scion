@@ -15,6 +15,7 @@
 :mod:`msg_meta` --- Message Metadata
 ====================================
 """
+# SCION
 from lib.packet.scion_addr import SCIONAddr
 
 
@@ -31,7 +32,7 @@ class MetadataBase(object):
 
     @classmethod
     def from_values(cls, ia=None, host=None, path=None, ext_hdrs=(),
-                    reuse=False, port=0):
+                    port=0, reuse=False):
         inst = cls()
         inst.ia = ia
         inst.host = host
@@ -43,9 +44,6 @@ class MetadataBase(object):
 
     def get_addr(self):
         return SCIONAddr.from_values(self.ia, self.host)
-
-    def close(self):  # Close communication between peers.
-        pass
 
     def __str__(self):
         return "%s:%d" % (self.get_addr(), self.port)
@@ -71,14 +69,11 @@ class TCPMetadata(MetadataBase):
     """
     @classmethod
     def from_values(cls, ia=None, host=None, path=None,
-                    ext_hdrs=(), port=0, sock=None, flags=0):
-        inst = super().from_values(ia, host, path, ext_hdrs, port)
+                    ext_hdrs=(), port=0, reuse=False, sock=None, flags=0):
+        inst = super().from_values(ia, host, path, ext_hdrs, port, reuse)
         inst.sock = sock
         inst.flags = flags
         return inst
-
-    def close(self):
-        self.sock.active = False
 
 
 class RawMetadata(MetadataBase):

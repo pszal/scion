@@ -145,4 +145,6 @@ HASHTREE_UPDATE_WINDOW = HASHTREE_TTL / 3
 # TCP polling timeouts, used by accept() and recv().
 TCP_ACCEPT_POLLING_TOUT = 1.0
 # SCION control-plane TCP connection timeout.
-TCP_TIMEOUT = 5.0
+TCP_TIMEOUT = 6.0
+# Paths used by TCP connections are updated after this time.
+PATH_TIMEOUT = 6.0  # FIXME(PSz): So low for testing purposes

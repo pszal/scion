@@ -124,8 +124,11 @@ const char * svc_to_str(uint16_t svc, char *buf) {
         case SVC_SIBRA:
             service = "SB";
             break;
+        case SVC_NONE & ~SVC_MULTICAST:
+            service = "NONE";
+            break;
         default:
-            snprintf(buf, MAX_HOST_ADDR_STR, "Unknown svc %d", svc);
+            snprintf(buf, MAX_HOST_ADDR_STR, "Unknown svc %d %d", svc, SVC_NONE);
             return buf;
     }
     snprintf(buf, MAX_HOST_ADDR_STR, "%s %c", service,
