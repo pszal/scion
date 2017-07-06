@@ -30,7 +30,7 @@ from lib.packet.scion_addr import ISD_AS, SCIONAddr
 from lib.packet.svc import SVCType
 from lib.tcp.socket import SCIONTCPSocket, SockOpt
 from lib.util import recv_all
-from test.integration.base_cli_srv import get_sciond_api_addr
+from integration.base_cli_srv import get_sciond_api_addr
 import lib.app.sciond as lib_sciond
 
 s_isd_as = ISD_AS("1-17")
