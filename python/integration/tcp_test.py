@@ -111,6 +111,7 @@ threading.Thread(target=server, args=[False]).start()
 threading.Thread(target=server, args=[True]).start()
 time.sleep(0.5)
 for i in range(10):
-    svc = False#(i % 2 == 0)  # set to False if USE_TCP=True (o/w client can connect to a real server)
+    # set to False if USE_TCP=True (o/w client can connect to a real server)
+    svc = False  # (i % 2 == 0)
     start = time.time()
     client(svc, i)

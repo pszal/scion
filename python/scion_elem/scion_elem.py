@@ -1121,6 +1121,9 @@ class SCIONElement(object):
         # no existing socket, check for connecting ones
         if addr in self._tcp_shared_socks_events:
             event = self._tcp_shared_socks_events[addr]
+            # PSz: it probably makes more sense to have a queue for messages that are
+            # going to reuse a connection. Then after connection is established the
+            # messages from this queue just go to self._sock2buf.
             threading.Thread(
                 target=thread_safety_net,
                 args=(self._tcp_wait_for_connect, msg, meta, event),
